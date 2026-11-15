@@ -1,0 +1,398 @@
+#!/usr/bin/python3 -I
+"""ogui-touchscreen-control: minimal, auditable touchscreen inhibit helper.
+
+Installed root-owned at /usr/local/libexec/ogui-touchscreen-control and
+invoked unprivileged for `status`, or through a narrowly scoped `sudo -n`
+rule for mutations.
+
+Security model
+--------------
+* No user-supplied paths, roots, commands, or file names.  The sysfs root is
+  a module constant; the only variable input is a sysfs input name matching
+  ^input[0-9]+$, which is re-validated against udev discovery before every
+  mutation.
+* /sys/class/input/inputN is a symlink into /sys/devices/..., so the write
+  target is the canonical physical device directory resolved by discovery.
+  The class symlink is never used as the write path.
+* Every mutation re-runs discovery and writes only to
+  <canonical physical device>/inhibited for a device that udev currently
+  classifies as a physical touchscreen and whose physical directory is
+  beneath the fixed /sys/devices tree.
+* The target must be a regular file (lstat, never a symlink).  Writes use
+  O_NOFOLLOW, verify the written value by reading it back, and roll back to
+  the previous value if readback does not match.
+* Test injection (fake sysfs root / fake udev) is available only through the
+  imported library functions.  The command line never accepts roots or
+  paths.
+
+Kernel semantics: writing 1 to <device>/inhibited suppresses all handlers
+for that input device; writing 0 restores them.  The value is volatile and
+resets on reboot.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from typing import Callable, Dict, List, Optional
+
+VERSION = "0.1.0"
+SYS_ROOT = "/sys"
+PHYSICAL_ROOT = os.path.join(SYS_ROOT, "devices")
+UDEVADM = "/usr/bin/udevadm"
+INPUT_NAME_RE = re.compile(r"^input[0-9]{1,6}$")
+MAX_INPUT_INDEX = 4096
+
+# udev tags that must never be treated as a touchscreen even if a buggy
+# database also sets ID_INPUT_TOUCHSCREEN=1.
+EXCLUDED_TAGS = (
+    "ID_INPUT_TOUCHPAD",
+    "ID_INPUT_JOYSTICK",
+    "ID_INPUT_GAMEPAD",
+    "ID_INPUT_ACCELEROMETER",
+    "ID_INPUT_POINTINGSTICK",
+)
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_NOT_ROOT = 3
+EXIT_DEVICE = 4
+EXIT_PERMISSION = 5
+
+
+class ControlError(Exception):
+    """Expected operational error; the message is safe to show to the user."""
+
+    def __init__(self, message: str, code: int = EXIT_DEVICE):
+        super().__init__(message)
+        self.code = code
+
+
+def _read_text(path: str, default: str = "") -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def _default_udev_probe(sys_path: str) -> Dict[str, str]:
+    """Return udev properties for the given sysfs path using a fixed argv.
+
+    No shell is involved.  The environment is replaced with a minimal one so
+    that user-controlled variables cannot influence the lookup.
+    """
+    try:
+        proc = subprocess.run(
+            [UDEVADM, "info", "--query=property", "--path", sys_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    props: Dict[str, str] = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key] = value
+    return props
+
+
+def _is_beneath(path: str, root: str) -> bool:
+    try:
+        real_path = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+    except OSError:
+        return False
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+def _physical_root(sys_root: str) -> str:
+    return os.path.realpath(os.path.join(sys_root, "devices"))
+
+
+def _physical_dir(sys_root: str, sysname: str) -> str:
+    """Resolve inputN to its canonical /sys/devices directory.
+
+    /sys/class/input/inputN is a symlink, so the only usable write location is
+    the real physical directory it points at.  The result must be canonical
+    and strictly beneath the sysfs devices tree.
+    """
+    if not INPUT_NAME_RE.fullmatch(sysname):
+        raise ControlError("invalid device id", EXIT_USAGE)
+    class_node = os.path.join(sys_root, "class", "input", sysname)
+    real = os.path.realpath(class_node)
+    if real == class_node or not real:
+        raise ControlError("device does not resolve to a physical sysfs path", EXIT_DEVICE)
+    root = _physical_root(sys_root)
+    if not (real == root or real.startswith(root + os.sep)):
+        raise ControlError("device resolves outside the sysfs devices tree", EXIT_DEVICE)
+    rel = os.path.relpath(real, root)
+    parts = rel.split(os.sep)
+    if "virtual" in parts:
+        raise ControlError("virtual devices are never controlled", EXIT_DEVICE)
+    if os.path.realpath(real) != real:
+        raise ControlError("device path is not canonical", EXIT_DEVICE)
+    return real
+
+
+def _bool_prop(props: Dict[str, str], key: str) -> bool:
+    return props.get(key, "0") == "1"
+
+
+def discover(sys_root: str = SYS_ROOT, udev_probe: Optional[Callable[[str], Dict[str, str]]] = None) -> List[dict]:
+    """Discover physical touchscreens with a kernel inhibit attribute.
+
+    Args:
+        sys_root: sysfs root.  Only tests/library consumers pass a fake root;
+            the CLI always uses SYS_ROOT.
+        udev_probe: callable mapping a sysfs path to a udev property dict.
+
+    Each returned device carries a private ``_physical_path`` used by
+    ``set_inhibited``; it is stripped from every public (JSON) response.
+    """
+    probe = udev_probe or _default_udev_probe
+    class_input = os.path.join(sys_root, "class", "input")
+    try:
+        entries = os.listdir(class_input)
+    except OSError:
+        return []
+
+    devices: List[dict] = []
+    for entry in entries:
+        if not INPUT_NAME_RE.fullmatch(entry):
+            continue
+        if int(entry[5:]) > MAX_INPUT_INDEX:
+            continue
+        node = os.path.join(class_input, entry)
+        if not os.path.exists(node):
+            continue  # stale/dangling class entry after a hotplug removal
+        if not _is_beneath(node, sys_root):
+            continue
+        try:
+            physical = _physical_dir(sys_root, entry)
+        except ControlError:
+            continue
+        # Never expose virtual/uinput devices even if udev mistags them.
+        if "/devices/virtual/" in physical + "/":
+            continue
+        props = probe(node) or {}
+        if not _bool_prop(props, "ID_INPUT_TOUCHSCREEN"):
+            continue
+        if any(_bool_prop(props, tag) for tag in EXCLUDED_TAGS):
+            continue
+        name = _read_text(os.path.join(physical, "name"), entry)
+        lowered = name.lower()
+        if "virtual" in lowered or "uinput" in lowered:
+            continue
+        driver = ""
+        driver_link = os.path.join(physical, "device", "driver")
+        if os.path.islink(driver_link):
+            driver = os.path.basename(os.path.realpath(driver_link))
+        inhibited_file = os.path.join(physical, "inhibited")
+        supported = True
+        reason = ""
+        try:
+            st = os.lstat(inhibited_file)
+            if not stat.S_ISREG(st.st_mode):
+                supported = False
+                reason = "kernel inhibit attribute is not a regular file"
+        except OSError:
+            supported = False
+            reason = "kernel inhibit attribute missing"
+        inhibited = None
+        if supported:
+            value = _read_text(inhibited_file, "?")
+            inhibited = value == "1"
+            if value not in ("0", "1"):
+                supported = False
+                reason = "kernel inhibit attribute unreadable"
+                inhibited = None
+        devices.append(
+            {
+                "id": entry,
+                "name": name,
+                "inhibited": inhibited,
+                "supported": supported,
+                "reason": reason,
+                "driver": driver,
+                "virtual": False,
+                "_physical_path": physical,
+            }
+        )
+    devices.sort(key=lambda d: int(d["id"][5:]))
+    return devices
+
+
+def _public_device(device: dict) -> dict:
+    return {k: v for k, v in device.items() if not k.startswith("_")}
+
+
+def read_status(sys_root: str = SYS_ROOT, udev_probe: Optional[Callable[[str], Dict[str, str]]] = None) -> dict:
+    devices = discover(sys_root, udev_probe)
+    return {
+        "ok": True,
+        "version": VERSION,
+        "devices": [_public_device(d) for d in devices],
+    }
+
+
+def _write_inhibited(path: str, inhibit: bool) -> None:
+    desired = b"1" if inhibit else b"0"
+    flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ControlError("cannot open kernel inhibit attribute: %s" % exc.strerror, EXIT_PERMISSION)
+    try:
+        try:
+            os.write(fd, desired)
+        except OSError as exc:
+            raise ControlError("cannot write kernel inhibit attribute: %s" % exc.strerror, EXIT_PERMISSION)
+    finally:
+        os.close(fd)
+
+
+def _verified_inhibit_path(sys_root: str, device: dict) -> str:
+    """Return <canonical physical device>/inhibited, re-checked at use time."""
+    physical = device.get("_physical_path")
+    if not isinstance(physical, str) or not physical:
+        raise ControlError("device has no canonical physical path", EXIT_DEVICE)
+    if os.path.realpath(physical) != physical:
+        raise ControlError("device path is not canonical", EXIT_DEVICE)
+    root = _physical_root(sys_root)
+    if not physical.startswith(root + os.sep):
+        raise ControlError("device path escapes the sysfs devices tree", EXIT_DEVICE)
+    if "virtual" in physical.split(os.sep):
+        raise ControlError("virtual devices are never controlled", EXIT_DEVICE)
+    target = os.path.join(physical, "inhibited")
+    try:
+        st = os.lstat(target)
+    except OSError:
+        raise ControlError("kernel inhibit attribute missing", EXIT_DEVICE)
+    if not stat.S_ISREG(st.st_mode):
+        raise ControlError("kernel inhibit attribute is not a regular file", EXIT_DEVICE)
+    return target
+
+
+def set_inhibited(
+    sysname: str,
+    inhibit: bool,
+    sys_root: str = SYS_ROOT,
+    udev_probe: Optional[Callable[[str], Dict[str, str]]] = None,
+) -> dict:
+    """Set inhibit state for exactly one freshly validated touchscreen."""
+    if not isinstance(sysname, str) or not INPUT_NAME_RE.fullmatch(sysname):
+        raise ControlError("invalid device id", EXIT_USAGE)
+    devices = discover(sys_root, udev_probe)
+    match = next((d for d in devices if d["id"] == sysname), None)
+    if match is None:
+        raise ControlError("device is not a discovered physical touchscreen", EXIT_DEVICE)
+    if not match["supported"]:
+        raise ControlError(match["reason"] or "device does not support inhibition", EXIT_DEVICE)
+    path = _verified_inhibit_path(sys_root, match)
+    previous = bool(match["inhibited"])
+    _write_inhibited(path, inhibit)
+    observed = _read_text(path, "?")
+    if observed != ("1" if inhibit else "0"):
+        # Best-effort rollback to the state we observed before the write.
+        try:
+            _write_inhibited(path, previous)
+        except ControlError:
+            pass
+        raise ControlError("kernel did not accept the new inhibit state", EXIT_DEVICE)
+    return {
+        "ok": True,
+        "device": {"id": sysname, "name": match["name"], "inhibited": inhibit},
+    }
+
+
+def restore_all(sys_root: str = SYS_ROOT, udev_probe: Optional[Callable[[str], Dict[str, str]]] = None) -> dict:
+    """Set every discovered supported touchscreen back to inhibited=0."""
+    devices = discover(sys_root, udev_probe)
+    restored: List[str] = []
+    errors: List[dict] = []
+    for device in devices:
+        if not device["supported"] or device["inhibited"] is False:
+            continue
+        try:
+            set_inhibited(device["id"], False, sys_root, udev_probe)
+            restored.append(device["id"])
+        except ControlError as exc:
+            errors.append({"id": device["id"], "error": str(exc)})
+    result = {
+        "ok": not errors,
+        "restored": restored,
+        "devices": [_public_device(d) for d in devices],
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def emit(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        raise ControlError("this operation requires root", EXIT_NOT_ROOT)
+
+
+USAGE = """usage: ogui-touchscreen-control <command> [args]
+
+commands:
+  status                 Show discovered touchscreens (unprivileged)
+  set <on|off> <inputN>  Inhibit (off) or restore (on) one touchscreen (root)
+  restore-all            Restore every detected touchscreen (root)
+  --version              Print version
+"""
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if not args or args[0] in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            return EXIT_OK
+        if args[0] == "--version":
+            sys.stdout.write(VERSION + "\n")
+            return EXIT_OK
+        command = args[0]
+        if command == "status":
+            if len(args) != 1:
+                raise ControlError("status takes no arguments", EXIT_USAGE)
+            emit(read_status())
+            return EXIT_OK
+        if command == "set":
+            if len(args) != 3 or args[1] not in ("on", "off"):
+                raise ControlError("usage: set <on|off> <inputN>", EXIT_USAGE)
+            if not INPUT_NAME_RE.fullmatch(args[2]):
+                raise ControlError("invalid device id", EXIT_USAGE)
+            _require_root()
+            result = set_inhibited(args[2], args[1] == "off")
+            emit(result)
+            return EXIT_OK
+        if command == "restore-all":
+            if len(args) != 1:
+                raise ControlError("restore-all takes no arguments", EXIT_USAGE)
+            _require_root()
+            emit(restore_all())
+            return EXIT_OK
+        raise ControlError("unknown command", EXIT_USAGE)
+    except ControlError as exc:
+        emit({"ok": False, "error": str(exc)})
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
