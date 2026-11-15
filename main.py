@@ -14,6 +14,7 @@ import json
 import os
 import re
 import signal
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import decky
@@ -21,9 +22,18 @@ import decky
 HELPER = "/usr/local/libexec/ogui-touchscreen-control"
 SUDO = "/usr/bin/sudo"
 INPUT_RE = re.compile(r"input[0-9]{1,6}\Z")
+APP_ID_RE = re.compile(r"[0-9]{1,20}\Z")
 STATUS_TIMEOUT = 5.0
 MUTATE_TIMEOUT = 20.0
 MAX_OUTPUT_BYTES = 64 * 1024
+
+SETTINGS_FILENAME = "game_rules.json"
+SETTINGS_VERSION = 1
+# Tests and embedders may point this at an isolated directory.
+SETTINGS_DIR: Optional[str] = None
+# A frontend heartbeat renews this lease; a lost frontend lets it expire.
+LEASE_SECONDS = 15.0
+WATCHDOG_INTERVAL = 2.0
 
 
 class HelperError(Exception):
@@ -174,6 +184,69 @@ def _failure(message: str, **extra: Any) -> Dict[str, Any]:
     return result
 
 
+def _valid_app_id(value: Any) -> bool:
+    """App ids are exact unsigned decimal strings; never coerce or truncate."""
+    return isinstance(value, str) and APP_ID_RE.fullmatch(value) is not None
+
+
+def _settings_dir() -> str:
+    if SETTINGS_DIR:
+        return SETTINGS_DIR
+    configured = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None)
+    if isinstance(configured, str) and configured:
+        return configured
+    configured = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
+    if configured:
+        return configured
+    raise HelperError("Decky settings directory is unavailable; preferences were not saved.")
+
+
+def _settings_path() -> str:
+    return os.path.join(_settings_dir(), SETTINGS_FILENAME)
+
+
+def _load_settings() -> Dict[str, Any]:
+    """Read preferences; a missing or corrupt file means the safe defaults."""
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError, HelperError):
+        return {"auto": False, "exceptions": []}
+    if not isinstance(raw, dict):
+        return {"auto": False, "exceptions": []}
+    exceptions: List[str] = []
+    stored = raw.get("exceptions")
+    if isinstance(stored, list):
+        for item in stored:
+            if _valid_app_id(item) and item not in exceptions:
+                exceptions.append(item)
+    return {"auto": raw.get("auto") is True, "exceptions": exceptions}
+
+
+def _save_settings(settings: Dict[str, Any]) -> None:
+    """Atomically persist preferences; failure is reported, never swallowed."""
+    payload = {
+        "version": SETTINGS_VERSION,
+        "auto": settings.get("auto") is True,
+        "exceptions": list(settings.get("exceptions") or []),
+    }
+    path = _settings_path()
+    temp = path + ".tmp"
+    try:
+        os.makedirs(_settings_dir(), exist_ok=True)
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except OSError as exc:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise HelperError(f"Could not save game rules: {exc.strerror or exc}")
+
+
 def _sudo_error(stderr: str, returncode: int) -> str:
     lowered = stderr.lower()
     if "password is required" in lowered or "no tty present" in lowered:
@@ -270,18 +343,54 @@ class Plugin:
         self._lock: Optional[asyncio.Lock] = None
         self._session_disabled: Dict[str, Dict[str, str]] = {}
         self._closing = False
+        self._settings: Dict[str, Any] = {"auto": False, "exceptions": []}
+        self._current_game: Optional[str] = None
+        self._lease_until = 0.0
+        self._generation = 0
+        self._auto_inhibited = False
+        self._auto_pending = False
+        self._automation_error = ""
+        self._watchdog_task: Optional[asyncio.Task] = None
 
     def _mutation_lock(self) -> asyncio.Lock:
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
 
+    def _desired_inhibit(self) -> bool:
+        """Automatic mode disables touch only for a running, non-excepted game."""
+        if not self._settings["auto"] or time.monotonic() >= self._lease_until:
+            return False
+        game = self._current_game
+        if game is None:
+            return False
+        return game not in self._settings["exceptions"]
+
+    def _settings_reply(self, **extra: Any) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "ok": True,
+            "auto": self._settings["auto"],
+            "exceptions": list(self._settings["exceptions"]),
+        }
+        result.update(extra)
+        return result
+
+    async def get_settings(self) -> Dict[str, Any]:
+        async with self._mutation_lock():
+            self._settings = _load_settings()
+            return self._settings_reply()
+
     async def get_status(self) -> Dict[str, Any]:
         async with self._mutation_lock():
-            try:
-                return _summarize(await _fetch_devices())
-            except HelperError as exc:
-                return _failure(str(exc))
+            return await self._read_status()
+
+    async def _read_status(self) -> Dict[str, Any]:
+        try:
+            result = _summarize(await _fetch_devices())
+        except HelperError as exc:
+            result = _failure(str(exc))
+        result.update(auto=self._settings["auto"], automation_error=self._automation_error)
+        return result
 
     async def _current(self, original: Dict[str, Any]) -> Dict[str, Any]:
         for current in await _fetch_devices():
@@ -320,67 +429,210 @@ class Plugin:
                 failed.append(f"{original['id']}: {exc}")
         return "complete" if not failed else "incomplete: " + "; ".join(failed)
 
+    async def _apply_desired(self, desired: bool) -> Dict[str, Any]:
+        """Drive every supported touchscreen to one verified inhibit state."""
+        applied: List[Tuple[Dict[str, Any], bool]] = []
+        try:
+            devices = await _fetch_devices()
+            supported = [d for d in devices if d["supported"]]
+            if not supported:
+                result = _summarize(devices)
+                result.update(ok=False, error=result["message"])
+                return result
+            for original in supported:
+                if original["inhibited"] == desired:
+                    continue
+                current = await self._current(original)
+                if current["inhibited"] == desired:
+                    continue
+                applied.append((original, current["inhibited"]))
+                # Keep ownership even if a command times out after writing and
+                # both verification and rollback fail. Never infer from stale status.
+                if desired and not current["inhibited"]:
+                    self._session_disabled[original["id"]] = _identity(original)
+                await _mutate(original["id"], desired)
+            observed = await _fetch_devices()
+            observed_supported = [d for d in observed if d["supported"]]
+            if (
+                {d["id"] for d in observed_supported}
+                != {d["id"] for d in supported}
+                or any(
+                    not any(_same_identity(a, b) for b in observed_supported)
+                    for a in supported
+                )
+                or any(d["inhibited"] != desired for d in observed_supported)
+            ):
+                raise HelperError(
+                    "Touchscreen state read-back did not confirm every target."
+                )
+            self._reconcile_session(observed)
+            result = _summarize(observed)
+            result["changed"] = len(applied)
+            return result
+        except (HelperError, asyncio.CancelledError) as exc:
+            rollback = await asyncio.shield(self._rollback(applied))
+            try:
+                self._reconcile_session(await _fetch_devices())
+            except HelperError:
+                pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return _failure(
+                f"Could not change every touchscreen: {exc}", rollback=rollback
+            )
+
     async def set_enabled(self, enabled: Any) -> Dict[str, Any]:
         if type(enabled) is not bool:
             return _failure("The touchscreen toggle requires a boolean value.")
         async with self._mutation_lock():
             if self._closing:
                 return _failure("Touchscreen plugin is unloading; no change was made.")
-            applied: List[Tuple[Dict[str, Any], bool]] = []
-            try:
-                devices = await _fetch_devices()
-                supported = [d for d in devices if d["supported"]]
-                if not supported:
-                    result = _summarize(devices)
-                    result.update(ok=False, error=result["message"])
-                    return result
-                desired = not enabled
-                for original in supported:
-                    if original["inhibited"] == desired:
-                        continue
-                    current = await self._current(original)
-                    if current["inhibited"] == desired:
-                        continue
-                    applied.append((original, current["inhibited"]))
-                    # Keep ownership even if a command times out after writing and
-                    # both verification and rollback fail. Never infer from stale status.
-                    if desired and not current["inhibited"]:
-                        self._session_disabled[original["id"]] = _identity(original)
-                    await _mutate(original["id"], desired)
-                observed = await _fetch_devices()
-                observed_supported = [d for d in observed if d["supported"]]
-                if (
-                    {d["id"] for d in observed_supported}
-                    != {d["id"] for d in supported}
-                    or any(
-                        not any(_same_identity(a, b) for b in observed_supported)
-                        for a in supported
-                    )
-                    or any(d["inhibited"] != desired for d in observed_supported)
-                ):
-                    raise HelperError(
-                        "Touchscreen state read-back did not confirm every target."
-                    )
-                self._reconcile_session(observed)
-                result = _summarize(observed)
-                result["changed"] = len(applied)
-                return result
-            except (HelperError, asyncio.CancelledError) as exc:
-                rollback = await asyncio.shield(self._rollback(applied))
-                try:
-                    self._reconcile_session(await _fetch_devices())
-                except HelperError:
-                    pass
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
+            if self._settings["auto"]:
                 return _failure(
-                    f"Could not change every touchscreen: {exc}", rollback=rollback
+                    "Touchscreen is controlled automatically while Games only is on."
                 )
+            result = await self._apply_desired(not enabled)
+            if result.get("ok"):
+                # Explicit verified manual control supersedes automatic recovery.
+                self._auto_pending = False
+                self._auto_inhibited = False
+                self._automation_error = ""
+            return result
+
+    async def _apply_auto(self, desired: bool) -> Dict[str, Any]:
+        # Retain recovery responsibility even if disable and rollback both fail.
+        self._auto_inhibited = self._auto_inhibited or desired
+        result = await self._apply_desired(desired)
+        self._auto_pending = not bool(result.get("ok"))
+        self._automation_error = result.get("error", "") if self._auto_pending else ""
+        if result.get("ok"):
+            self._auto_inhibited = desired
+        result.update(auto=self._settings["auto"], exceptions=list(self._settings["exceptions"]),
+                      automation_error=self._automation_error)
+        return result
+
+    async def set_auto_enabled(self, auto: Any) -> Dict[str, Any]:
+        if type(auto) is not bool:
+            return _failure("Games only requires a boolean value.")
+        self._generation += 1
+        async with self._mutation_lock():
+            if self._closing:
+                return _failure("Touchscreen plugin is unloading; no change was made.")
+            updated = {
+                "auto": auto,
+                "exceptions": list(self._settings["exceptions"]),
+            }
+            try:
+                _save_settings(updated)
+            except HelperError as exc:
+                return _failure(str(exc), auto=self._settings["auto"])
+            self._settings = updated
+            if not auto:
+                self._lease_until = 0.0
+                self._current_game = None
+            return await self._apply_auto(self._desired_inhibit())
+
+    async def set_exception(self, appid: Any, keep: Any) -> Dict[str, Any]:
+        if not _valid_app_id(appid):
+            return _failure("Game exceptions require a numeric app id string.")
+        if type(keep) is not bool:
+            return _failure("Game exception state requires a boolean value.")
+        self._generation += 1
+        async with self._mutation_lock():
+            if self._closing:
+                return _failure("Touchscreen plugin is unloading; no change was made.")
+            exceptions = list(self._settings["exceptions"])
+            if keep:
+                if appid not in exceptions:
+                    exceptions.append(appid)
+            else:
+                exceptions = [item for item in exceptions if item != appid]
+            updated = {"auto": self._settings["auto"], "exceptions": exceptions}
+            try:
+                _save_settings(updated)
+            except HelperError as exc:
+                return _failure(
+                    str(exc),
+                    auto=self._settings["auto"],
+                    exceptions=list(self._settings["exceptions"]),
+                )
+            self._settings = updated
+            if not self._settings["auto"] or self._current_game != appid:
+                return self._settings_reply(applied=False)
+            desired = self._desired_inhibit()
+            result = await self._apply_auto(desired)
+            result["applied"] = bool(result.get("changed"))
+            return result
+
+    async def report_game_state(self, appid: Any) -> Dict[str, Any]:
+        """Frontend heartbeat: the running game id, or None when no game runs."""
+        if appid is not None and not _valid_app_id(appid):
+            return _failure("Game reports require a numeric app id string or null.")
+        received = time.monotonic()
+        self._generation += 1
+        generation = self._generation
+        async with self._mutation_lock():
+            if self._closing:
+                return _failure("Touchscreen plugin is unloading; no change was made.")
+            if generation != self._generation:
+                # A newer report or settings change superseded this one.
+                return self._settings_reply(applied=False, stale=True)
+            if not self._settings["auto"]:
+                # Read-only heartbeat: reflects watchdog recovery without ever
+                # overriding manual control, including while the panel is open.
+                result = await self._read_status()
+                result.update(applied=False, exceptions=list(self._settings["exceptions"]))
+                return result
+            # Waiting behind helper IO must not make an old report fresh again.
+            self._lease_until = received + LEASE_SECONDS
+            self._current_game = appid if time.monotonic() < self._lease_until else None
+            desired = self._desired_inhibit()
+            result = await self._apply_auto(desired)
+            result["applied"] = bool(result.get("changed"))
+            return result
+
+    async def release_auto(self) -> Dict[str, Any]:
+        """Frontend released automation: restore touch but keep the preference."""
+        self._generation += 1
+        async with self._mutation_lock():
+            if self._closing:
+                return _failure("Touchscreen plugin is unloading; no change was made.")
+            self._lease_until = 0.0
+            self._current_game = None
+            if not self._settings["auto"] and not self._auto_pending:
+                return self._settings_reply(applied=False)
+            return await self._apply_auto(False)
+
+    async def _watchdog_tick(self) -> None:
+        async with self._mutation_lock():
+            if self._closing:
+                return
+            expired = time.monotonic() >= self._lease_until
+            if not self._auto_pending and not (expired and self._auto_inhibited):
+                return
+            if expired:
+                self._current_game = None
+            await self._apply_auto(self._desired_inhibit())
+
+    async def _watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            try:
+                await self._watchdog_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let the watcher die silently
+                logger = _log()
+                if logger:
+                    logger.error(f"Touchscreen watchdog tick failed: {exc}")
 
     async def _main(self) -> None:
+        self._settings = _load_settings()
         logger = _log()
         if logger:
             logger.info("Touchscreen toggle loaded; no device state was changed.")
+        if self._watchdog_task is None:
+            self._watchdog_task = asyncio.create_task(self._watchdog())
 
     async def _restore_owned(self) -> None:
         async with self._mutation_lock():
@@ -404,6 +656,14 @@ class Plugin:
 
     async def _unload(self) -> None:
         self._closing = True
+        task = self._watchdog_task
+        self._watchdog_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             # Decky 3.3.1 kills backend processes after five seconds on stop.
             # Leave time for subprocess cleanup; abrupt termination cannot guarantee restore.

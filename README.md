@@ -1,94 +1,51 @@
 # Touchscreen Toggle
 
-A Decky plugin with one **Disable touchscreen** switch. On disables every supported
-physical touchscreen; Off enables them. It does not cover the game with an overlay
-or change controller and mouse settings.
+Control physical touchscreen input from the [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) Quick Access Menu.
 
-The panel reads the actual touchscreen state when it opens. There is no refresh
-button or background polling. Changes use independent state readback. If only some
-screens change, the plugin tries to restore their previous state and reports the
-failure. Unsupported touchscreens are listed but not changed.
+## Features
 
-## Status
+- **Disable touchscreen:** turn touch off or on manually while Games only is off.
+- **Games only:** disable touch during games and restore it outside games. Manual control is read-only while this is enabled.
+- **Game exceptions:** choose installed games that should keep touch enabled. Saved selections remain if a game is uninstalled.
 
-This is an experimental, manually installed plugin, not an official Decky-store
-release. The current build is installed and confirmed working by the maintainer on
-a Lenovo Legion Go S running Bazzite 45. It includes the **Disable touchscreen**
-switch and automatic status refresh when the panel opens. Steam Deck/SteamOS
-Stable and Beta testing is still needed. Legion Go 2, ROG Ally variants and other
-handhelds have not been hardware-verified; generic discovery is not certification.
+The settings include controller-accessible help. Controller and mouse input are not changed.
 
-Most implementation code was generated with AI assistance. Requirements and
-physical testing came from the maintainer. This source is supplied for human
-review; it is not being represented as predominantly human-written code.
+## Compatibility
 
-## Required helper
+Requires a physical touchscreen with kernel input-inhibit support. Manual control has been verified on a Lenovo Legion Go S running Bazzite 45.
 
-The backend runs as the normal Decky host user. It calls the fixed root-owned
-`/usr/local/libexec/ogui-touchscreen-control` through a narrow sudoers permission.
-The helper discovers physical touchscreens through udev, validates each target
-again before writing, and uses the kernel's `inhibited` attribute. It excludes
-mouse, touchpad, controller and virtual devices.
+Games-only automation remains experimental. Steam Deck/SteamOS and other handhelds have not yet been hardware-verified.
 
-This source includes the helper and its existing prerequisite installer. The
-installer installs the helper and scoped permissions only, not an OGUI interface.
-Its historical `ogui-touch-toggle` filenames remain to match the tested deployment.
-Do not run it merely to review or build this package.
+## Installation
 
-On a supported system, first inspect the scripts and run their no-write preview:
+Install Decky Loader first. From this repository's directory, review and install the required touchscreen helper:
 
 ```sh
 bash installer/install.sh --dry-run --user "$USER"
-```
-
-The actual prerequisite setup requires administrator approval:
-
-```sh
 sudo bash installer/install.sh --user "$USER"
 ```
 
-Then install the plugin ZIP through Decky's manual plugin installer. A fresh
-SteamOS installation of the helper is not yet hardware-verified. If a required
-system path is read-only or prerequisite checks fail, stop rather than disabling
-OS protections. The runtime ZIP alone does not install these prerequisites.
+Install the built ZIP through Decky's manual plugin installer. The ZIP does not install the helper. If the helper cannot be installed on your system, stop rather than disabling OS protections.
 
-Removing the helper while this Decky plugin is in use breaks the toggle. The
-included uninstall script restores touch before removing the shared helper and
-permissions; review its impact before running it.
+## Build
 
-## Recovery
-
-Turning **Disable touchscreen** on also disables touch navigation in menus and Desktop Mode. Keep a controller,
-keyboard or remote recovery connection available. Reboot restores touch because
-no off-state is saved. Orderly plugin unload tries to restore only screens this
-session disabled, but a crash or forced stop can prevent that recovery. You can
-also enable touch by turning the switch off or using the helper's scoped
-`restore-all` command.
-
-## Build and test
-
-Use Node and pnpm 9 with the checked-in lockfile:
+Requires Node.js, pnpm 9 and Python 3.
 
 ```sh
 pnpm install --frozen-lockfile
-npm test
 npm run typecheck
 npm run build
-python3 -m venv .venv
-.venv/bin/python -m pip install pytest pytest-asyncio
-.venv/bin/python -m pytest tests -q
 python3 scripts/package.py
 ```
 
-Tests simulate touchscreen devices and kernel trees; they do not replace physical
-input testing. The package script copies an explicit list of runtime files and
-checks required outputs. It does not install anything.
+## Recovery
 
-See `THIRD_PARTY_NOTICES.md` for template and dependency notices. Project code is
-licensed under GPL-3.0-only, subject to the retained notices for dependencies.
+Disabling touch affects Steam menus and Desktop Mode too. Keep a controller, mouse or keyboard available. To restore touch, turn off Games only and Disable touchscreen, or reboot.
 
-## Marketplace submission
+Remove the Decky plugin before uninstalling its shared helper.
 
-See [SUBMISSION.md](SUBMISSION.md) for the remaining eligibility, SteamOS testing,
-metadata and screenshot requirements. Publishing this source does not mean the
-plugin is accepted by, or currently eligible for, the official store.
+## License and credits
+
+GPL-3.0-only. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the Decky template and dependency notices.
+
+Most implementation code was generated with AI assistance.
