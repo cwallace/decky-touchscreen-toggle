@@ -20,6 +20,8 @@ Games-only automation remains experimental. Steam Deck/SteamOS and other handhel
 
 ## Installation
 
+Download the versioned ZIP from the **Artifacts** section of a successful [Build plugin](https://github.com/cwallace/decky-touchscreen-toggle/actions/workflows/build.yml) run. CI uploads the installable ZIP directly, without an extra ZIP wrapper.
+
 Install Decky Loader first, then install the built ZIP through Decky's manual plugin installer. The plugin is self-contained: it bundles its touchscreen helper and declares Decky's `root` flag, so Decky runs the backend as root. No separate installer, sudoers rule, group or system-wide helper is required.
 
 ## Build
