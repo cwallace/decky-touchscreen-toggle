@@ -29,7 +29,7 @@ Captured on a Lenovo Legion Go S running Bazzite 45. The settings include contro
 
 ## Compatibility
 
-**0.5 Beta** (`0.5.0-beta.1`) is an early testing release. Hardware testing is limited to one Lenovo Legion Go S running Bazzite 45; broader testing is needed before 1.0.
+**0.5 Beta** (`0.5.0`) is an early testing release. Hardware testing is limited to one Lenovo Legion Go S running Bazzite 45; broader testing is needed before 1.0.
 
 Requires Linux, Decky Loader and a physical touchscreen with kernel input-inhibit support. Manual control and the screenshots above use the earlier external-helper build. The self-contained beta still needs a fresh device installation check.
 
@@ -39,7 +39,7 @@ Games-only automation remains experimental. Steam Deck/SteamOS and other handhel
 
 This plugin is not yet listed in the Decky Plugin Store. If accepted, users will install and update it directly through Decky's store.
 
-For development testing, download the versioned plugin ZIP from a successful [Build plugin](https://github.com/cwallace/decky-touchscreen-toggle/actions/workflows/build.yml) run and use Decky's manual plugin installer. Published [GitHub releases](https://github.com/cwallace/decky-touchscreen-toggle/releases) will also receive an installable plugin ZIP automatically; no release has been published yet.
+For development testing, download the versioned plugin ZIP from a successful [Build plugin](https://github.com/cwallace/decky-touchscreen-toggle/actions/workflows/build.yml) run and use Decky's manual plugin installer. Published [GitHub releases](https://github.com/cwallace/decky-touchscreen-toggle/releases) receive an installable plugin ZIP automatically.
 
 Use `touchscreen-toggle-<version>.zip`, not GitHub's **Source code** archives. The source archives contain development files rather than the built plugin.
 
@@ -65,7 +65,7 @@ Pushes, pull requests and manual workflow runs build a plugin ZIP as a GitHub Ac
 To publish a new version after the workflow is on GitHub:
 
 1. Update `package.json` and the helper's `VERSION` in `bin/touchscreen-control`, then commit and push the changes.
-2. Create a GitHub release pointing to that commit, using a tag matching `package.json`, such as `v0.5.0-beta.1`. The same version without the leading `v` is also accepted.
+2. Create a GitHub release pointing to that commit, using a tag matching `package.json`, such as `v0.5.0`. The same version without the leading `v` is also accepted.
 3. Mark beta versions as **prereleases**, then publish. Publishing a stable release or prerelease starts the build workflow.
 4. Wait for **Build plugin** to finish. It validates the tag, builds the tagged source and attaches `touchscreen-toggle-<version>.zip` to the release.
 
