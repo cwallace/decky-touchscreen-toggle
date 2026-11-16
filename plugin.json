@@ -1,6 +1,17 @@
 {
   "name": "Touchscreen Toggle",
   "author": "Chris Wallace",
-  "flags": ["root"],
-  "api_version": 1
+  "flags": [
+    "root"
+  ],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "utility",
+      "input",
+      "root"
+    ],
+    "description": "Control touchscreen input manually or automatically during games, with per-game exceptions.",
+    "image": "https://raw.githubusercontent.com/cwallace/decky-touchscreen-toggle/main/assets/store.png"
+  }
 }

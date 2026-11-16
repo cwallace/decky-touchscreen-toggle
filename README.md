@@ -1,39 +1,77 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Touchscreen Toggle" width="640">
+</p>
+
 # Touchscreen Toggle
 
-**0.5 Beta** (`0.5.0-beta.1`) — early testing release. Hardware testing so far is limited to one Lenovo Legion Go S running Bazzite 45; broader testing is needed before 1.0.
+A small [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for controlling touchscreen input:
 
-Control physical touchscreen input from the [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) Quick Access Menu.
+- **Disable touchscreen** turns touch off or on manually while Games only is off.
+- **Games only** disables touch during games and restores it outside games.
+- **Game exceptions** lets you choose installed games that should keep touch enabled.
 
-## Features
+## Screenshots
 
-- **Disable touchscreen:** turn touch off or on manually while Games only is off.
-- **Games only:** disable touch during games and restore it outside games. Manual control is read-only while this is enabled.
-- **Game exceptions:** choose installed games that should keep touch enabled. Saved selections remain if a game is uninstalled.
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <a href="assets/screenshots/settings.png"><img src="assets/screenshots/settings.png" alt="Touchscreen Toggle settings with touch enabled, Games only on, and manual control unavailable while automatic control is active" width="360"></a>
+      <p>Settings with Games only enabled.</p>
+    </td>
+    <td valign="top" width="50%">
+      <a href="assets/screenshots/decky-menu.png"><img src="assets/screenshots/decky-menu.png" alt="Touchscreen Toggle entry in Decky's plugin menu" width="360"></a>
+      <p>Open Touchscreen Toggle from the Decky menu.</p>
+    </td>
+  </tr>
+</table>
 
-The settings include controller-accessible help. Controller and mouse input are not changed.
+Captured on a Lenovo Legion Go S running Bazzite 45. The settings include controller-accessible **?** help. Controller and mouse input are not changed.
 
 ## Compatibility
 
-Requires a physical touchscreen with kernel input-inhibit support. Manual control has been verified on a Lenovo Legion Go S running Bazzite 45.
+**0.5 Beta** (`0.5.0-beta.1`) is an early testing release. Hardware testing is limited to one Lenovo Legion Go S running Bazzite 45; broader testing is needed before 1.0.
 
-Games-only automation remains experimental. Steam Deck/SteamOS and other handhelds have not yet been hardware-verified.
+Requires Linux, Decky Loader and a physical touchscreen with kernel input-inhibit support. Manual control and the screenshots above use the earlier external-helper build. The self-contained beta still needs a fresh device installation check.
+
+Games-only automation remains experimental. Steam Deck/SteamOS and other handhelds have not yet been hardware-verified. Saved game exceptions remain if a game is uninstalled.
 
 ## Installation
 
-Download the versioned ZIP from the **Artifacts** section of a successful [Build plugin](https://github.com/cwallace/decky-touchscreen-toggle/actions/workflows/build.yml) run. CI uploads the installable ZIP directly, without an extra ZIP wrapper.
+This plugin is not yet listed in the Decky Plugin Store. If accepted, users will install and update it directly through Decky's store.
 
-Install Decky Loader first, then install the built ZIP through Decky's manual plugin installer. The plugin is self-contained: it bundles its touchscreen helper and declares Decky's `root` flag, so Decky runs the backend as root. No separate installer, sudoers rule, group or system-wide helper is required.
+For development testing, download the versioned plugin ZIP from a successful [Build plugin](https://github.com/cwallace/decky-touchscreen-toggle/actions/workflows/build.yml) run and use Decky's manual plugin installer. Published [GitHub releases](https://github.com/cwallace/decky-touchscreen-toggle/releases) will also receive an installable plugin ZIP automatically; no release has been published yet.
+
+Use `touchscreen-toggle-<version>.zip`, not GitHub's **Source code** archives. The source archives contain development files rather than the built plugin.
+
+The touchscreen helper is bundled inside the plugin. Decky's `root` flag lets the backend control the kernel input-inhibit attribute; no separate installer, sudoers rule or system-wide helper is needed. Preferences stay in Decky's managed settings directory so updates preserve them.
 
 ## Build
 
-Requires Node.js, pnpm 9 and Python 3.
+Requires Node.js 24, pnpm 9.15.9 and Python 3.9 or newer.
 
 ```sh
 pnpm install --frozen-lockfile
-npm run typecheck
-npm run build
+pnpm run typecheck
+pnpm run build
 python3 scripts/package.py
 ```
+
+The installable ZIP is written to `dist/`. The standard Decky CLI also packages the bundled helper and notices; `defaults/` is flattened into the installed plugin directory.
+
+## Releases
+
+Pushes, pull requests and manual workflow runs build a plugin ZIP as a GitHub Actions artifact. They do not create a release.
+
+To publish a new version after the workflow is on GitHub:
+
+1. Update `package.json` and the helper's `VERSION` in `bin/touchscreen-control`, then commit and push the changes.
+2. Create a GitHub release pointing to that commit, using a tag matching `package.json`, such as `v0.5.0-beta.1`. The same version without the leading `v` is also accepted.
+3. Mark beta versions as **prereleases**, then publish. Publishing a stable release or prerelease starts the build workflow.
+4. Wait for **Build plugin** to finish. It validates the tag, builds the tagged source and attaches `touchscreen-toggle-<version>.zip` to the release.
+
+GitHub supplies the **Source code (zip)** and **Source code (tar.gz)** downloads automatically. A mismatched tag stops the plugin build before an asset is attached. Existing assets are not overwritten automatically; rerunning an already completed upload requires resolving the duplicate asset first.
+
+GitHub releases do not publish the plugin to the Decky marketplace.
 
 ## Recovery
 
@@ -41,6 +79,14 @@ Disabling touch affects Steam menus and Desktop Mode too. Keep a controller, mou
 
 ## License and credits
 
-GPL-3.0-only. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the Decky template and dependency notices.
+Plugin code: **GPL-2.0-only**, matching Decky Loader's GPLv2 license. See [LICENSE](LICENSE). Source and build instructions are available in [this repository](https://github.com/cwallace/decky-touchscreen-toggle).
+
+Third-party components retain their own licenses:
+
+- Decky plugin template: BSD-3-Clause, original copyright Steam Deck Homebrew; its notice is included in `defaults/licenses/decky-template.BSD-3-Clause.txt`.
+- Bundled `@decky/api` 1.1.3: LGPL-2.1, [SteamDeckHomebrew/loader-api](https://github.com/SteamDeckHomebrew/loader-api); its license is included in `defaults/licenses/decky-api.LICENSE`.
+- Font Awesome Free 5.15.4 **hand-pointer** artwork by Fonticons, Inc.: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), [original SVG](https://github.com/FortAwesome/Font-Awesome/blob/5.15.4/svgs/solid/hand-pointer.svg). The design is unchanged and appears in the plugin and README logo; attribution is included in `defaults/licenses/font-awesome.LICENSE`.
+
+Installed packages carry these notices under `licenses/`. React and Decky's UI are provided by Decky Loader, not bundled here. Build tools are not shipped in the plugin.
 
 Most implementation code was generated with AI assistance.
