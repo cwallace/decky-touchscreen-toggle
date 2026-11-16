@@ -11,6 +11,7 @@ files = [
     "plugin.json",
     "package.json",
     "dist/index.js",
+    "bin/touchscreen-control",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",

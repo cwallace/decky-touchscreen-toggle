@@ -1,10 +1,11 @@
 """Decky backend for a single global physical-touchscreen toggle.
 
-The backend never writes sysfs itself.  It asks the fixed, separately
-installed helper (``/usr/local/libexec/ogui-touchscreen-control``) for the
-current device list and performs mutations only through the helper's narrow
-passwordless-sudo boundary.  A mutation is reported as successful only after
-an independent status read-back confirms every device this operation changed.
+The backend never writes sysfs itself.  It runs the helper bundled inside the
+plugin (``bin/touchscreen-control``) with a fixed interpreter and argv, and
+performs mutations only through that helper's narrow, re-validated interface.
+Decky starts this backend as root because ``plugin.json`` declares the
+``root`` flag.  A mutation is reported as successful only after an independent
+status read-back confirms every device this operation changed.
 """
 
 from __future__ import annotations
@@ -14,13 +15,14 @@ import json
 import os
 import re
 import signal
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import decky
 
-HELPER = "/usr/local/libexec/ogui-touchscreen-control"
-SUDO = "/usr/bin/sudo"
+PYTHON = "/usr/bin/python3"
+HELPER_NAME = "touchscreen-control"
 INPUT_RE = re.compile(r"input[0-9]{1,6}\Z")
 APP_ID_RE = re.compile(r"[0-9]{1,20}\Z")
 STATUS_TIMEOUT = 5.0
@@ -42,6 +44,23 @@ class HelperError(Exception):
 
 def _log() -> Any:
     return getattr(decky, "logger", None)
+
+
+def _plugin_dir() -> str:
+    """The installed plugin directory Decky provides; never the CWD."""
+    configured = getattr(decky, "DECKY_PLUGIN_DIR", None)
+    if not (isinstance(configured, str) and configured):
+        configured = os.environ.get("DECKY_PLUGIN_DIR")
+    if not (isinstance(configured, str) and os.path.isabs(configured)):
+        raise HelperError(
+            "Decky plugin directory is unavailable; the touchscreen helper "
+            "cannot be located."
+        )
+    return configured
+
+
+def _helper_path() -> str:
+    return os.path.join(_plugin_dir(), "bin", HELPER_NAME)
 
 
 def _identity(device: Dict[str, Any]) -> Dict[str, str]:
@@ -231,34 +250,33 @@ def _save_settings(settings: Dict[str, Any]) -> None:
         "exceptions": list(settings.get("exceptions") or []),
     }
     path = _settings_path()
-    temp = path + ".tmp"
+    directory = _settings_dir()
+    temp = ""
     try:
-        os.makedirs(_settings_dir(), exist_ok=True)
-        with open(temp, "w", encoding="utf-8") as handle:
+        os.makedirs(directory, exist_ok=True)
+        # Decky's settings directory is host-user owned, so a predictable
+        # temporary name could be pre-created as a symlink and followed as root.
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".game_rules.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp = handle.name
+            os.fchmod(handle.fileno(), 0o644)
             json.dump(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
     except OSError as exc:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
+        if temp:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
         raise HelperError(f"Could not save game rules: {exc.strerror or exc}")
-
-
-def _sudo_error(stderr: str, returncode: int) -> str:
-    lowered = stderr.lower()
-    if "password is required" in lowered or "no tty present" in lowered:
-        return (
-            "Touchscreen helper authorization is unavailable: passwordless sudo "
-            "for the helper is not configured."
-        )
-    if "not allowed" in lowered:
-        return "The current user is not authorized to run the touchscreen helper."
-    if "command not found" in lowered or "no such file" in lowered:
-        return "Touchscreen helper is not installed."
-    return f"Touchscreen helper command failed (exit {returncode})."
 
 
 async def _terminate(proc: "asyncio.subprocess.Process") -> None:
@@ -277,11 +295,17 @@ async def _terminate(proc: "asyncio.subprocess.Process") -> None:
         pass
 
 
-async def _run_helper(argv: List[str], timeout: float) -> Tuple[int, str, str]:
-    """Run one helper command with argv (never a shell), bounded and reaped."""
+async def _run_helper(args: List[str], timeout: float) -> Tuple[int, str, str]:
+    """Run one bundled-helper command with fixed argv (never a shell)."""
+    helper = _helper_path()
+    if not os.path.isfile(helper):
+        raise HelperError("Touchscreen helper is missing from the plugin directory.")
     try:
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            PYTHON,
+            "-I",
+            helper,
+            *args,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -289,7 +313,7 @@ async def _run_helper(argv: List[str], timeout: float) -> Tuple[int, str, str]:
             start_new_session=True,
         )
     except FileNotFoundError:
-        raise HelperError("Touchscreen helper is not installed.")
+        raise HelperError("Touchscreen helper interpreter is unavailable.")
     except OSError as exc:
         raise HelperError(
             f"Touchscreen helper could not be started: {exc.strerror or exc}"
@@ -312,7 +336,7 @@ async def _run_helper(argv: List[str], timeout: float) -> Tuple[int, str, str]:
 
 
 async def _fetch_devices() -> List[Dict[str, Any]]:
-    returncode, stdout, _stderr = await _run_helper([HELPER, "status"], STATUS_TIMEOUT)
+    returncode, stdout, _stderr = await _run_helper(["status"], STATUS_TIMEOUT)
     payload = _parse_payload(stdout)
     if returncode != 0:
         if payload is not None and isinstance(payload.get("error"), str):
@@ -324,16 +348,16 @@ async def _fetch_devices() -> List[Dict[str, Any]]:
 
 
 async def _mutate(device_id: str, inhibit: bool) -> None:
-    """Inhibit (off) or restore (on) one supported touchscreen through sudo."""
+    """Inhibit (off) or restore (on) one supported touchscreen via the helper."""
     action = "off" if inhibit else "on"
-    returncode, stdout, stderr = await _run_helper(
-        [SUDO, "-n", "--", HELPER, "set", action, device_id], MUTATE_TIMEOUT
+    returncode, stdout, _stderr = await _run_helper(
+        ["set", action, device_id], MUTATE_TIMEOUT
     )
     payload = _parse_payload(stdout)
     if returncode != 0:
         if payload is not None and isinstance(payload.get("error"), str):
             raise HelperError(payload["error"])
-        raise HelperError(_sudo_error(stderr, returncode))
+        raise HelperError(f"Touchscreen helper command failed (exit {returncode}).")
     if payload is None or payload.get("ok") is not True:
         raise HelperError("Touchscreen helper did not confirm the change.")
 

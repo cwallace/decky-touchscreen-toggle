@@ -1,5 +1,7 @@
 # Touchscreen Toggle
 
+**0.5 Beta** (`0.5.0-beta.1`) — early testing release. Hardware testing so far is limited to one Lenovo Legion Go S running Bazzite 45; broader testing is needed before 1.0.
+
 Control physical touchscreen input from the [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) Quick Access Menu.
 
 ## Features
@@ -18,14 +20,7 @@ Games-only automation remains experimental. Steam Deck/SteamOS and other handhel
 
 ## Installation
 
-Install Decky Loader first. From this repository's directory, review and install the required touchscreen helper:
-
-```sh
-bash installer/install.sh --dry-run --user "$USER"
-sudo bash installer/install.sh --user "$USER"
-```
-
-Install the built ZIP through Decky's manual plugin installer. The ZIP does not install the helper. If the helper cannot be installed on your system, stop rather than disabling OS protections.
+Install Decky Loader first, then install the built ZIP through Decky's manual plugin installer. The plugin is self-contained: it bundles its touchscreen helper and declares Decky's `root` flag, so Decky runs the backend as root. No separate installer, sudoers rule, group or system-wide helper is required.
 
 ## Build
 
@@ -40,9 +35,7 @@ python3 scripts/package.py
 
 ## Recovery
 
-Disabling touch affects Steam menus and Desktop Mode too. Keep a controller, mouse or keyboard available. To restore touch, turn off Games only and Disable touchscreen, or reboot.
-
-Remove the Decky plugin before uninstalling its shared helper.
+Disabling touch affects Steam menus and Desktop Mode too. Keep a controller, mouse or keyboard available. To restore touch, turn off Games only and Disable touchscreen, or reboot. The plugin attempts to restore touchscreens it disabled when unloaded or removed; kernel inhibit state does not survive a reboot.
 
 ## License and credits
 

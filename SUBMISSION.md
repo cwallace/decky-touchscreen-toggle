@@ -24,11 +24,11 @@ Official guidance:
 
 ## Remaining submission work
 
-- [x] Source, tests, fixed helper, installer, licenses and build lockfile are included.
-- [x] Current UI and helper were installed on the maintainer's Legion Go S/Bazzite 45.
+- [x] Source, bundled helper, licenses and build lockfile are included.
+- [x] The previous external-helper build was installed on the maintainer's Legion Go S/Bazzite 45.
 - [x] Maintainer confirmed the current UI meets the requested behavior.
 - [ ] Obtain a maintainer eligibility decision with accurate AI disclosure.
-- [ ] Verify fresh prerequisite installation on SteamOS without weakening OS protections.
+- [ ] Verify a fresh self-contained ZIP installation on SteamOS without weakening OS protections.
 - [ ] Verify operation on both SteamOS Stable and Beta, as required by the developer checklist.
 - [ ] Obtain a third-party SteamOS Stable/Beta test report; do not self-attest it.
 - [ ] Complete store `publish` metadata with real tags, description and image asset.
@@ -46,13 +46,16 @@ Once eligible and tested, fork `SteamDeckHomebrew/decky-plugin-database` and add
 1. One `.gitmodules` entry pointing to this public source repository.
 2. One gitlink at `plugins/touchscreen-toggle`, pinned to the exact reviewed commit.
 
-Keep the source, tests and helper in this repository, not copied into the database
+Keep the source and bundled helper in this repository, not copied into the database
 PR. Record the actual source commit in the PR and complete the current official
 template honestly. Use the upstream-requested branch and submission process as
 verified at submission time. No Decky Loader changes are required for this design.
 
 ## Installation boundary
 
-The runtime ZIP does not install the helper or grant permissions. The included
-administrator-approved prerequisite installer is still required. That requirement
-must be visible to reviewers and testers; it is not an automatic store install.
+The runtime ZIP is self-contained: it includes the helper at
+`bin/touchscreen-control` and declares Decky's `root` flag, so Decky runs the
+plugin backend as root. No separate installer, sudoers rule, group or
+system-wide helper is involved. Preferences stay in Decky's managed settings
+directory, so plugin updates preserve them. This refactor has not yet been
+installed or hardware-verified on a device.

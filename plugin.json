@@ -1,6 +1,6 @@
 {
   "name": "Touchscreen Toggle",
-  "author": "Wallace Family",
-  "flags": [],
+  "author": "Chris Wallace",
+  "flags": ["root"],
   "api_version": 1
 }

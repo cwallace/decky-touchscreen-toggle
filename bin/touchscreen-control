@@ -1,9 +1,10 @@
 #!/usr/bin/python3 -I
-"""ogui-touchscreen-control: minimal, auditable touchscreen inhibit helper.
+"""touchscreen-control: minimal, auditable touchscreen inhibit helper.
 
-Installed root-owned at /usr/local/libexec/ogui-touchscreen-control and
-invoked unprivileged for `status`, or through a narrowly scoped `sudo -n`
-rule for mutations.
+Bundled inside the Decky plugin at ``bin/touchscreen-control`` and run by the
+plugin backend with a fixed interpreter and argv (``/usr/bin/python3 -I``).
+Decky starts that backend as root because ``plugin.json`` declares the
+``root`` flag, so no sudo, polkit, group or system-wide install is involved.
 
 Security model
 --------------
@@ -40,7 +41,7 @@ import subprocess
 import sys
 from typing import Callable, Dict, List, Optional
 
-VERSION = "0.1.0"
+VERSION = "0.5.0-beta.1"
 SYS_ROOT = "/sys"
 PHYSICAL_ROOT = os.path.join(SYS_ROOT, "devices")
 UDEVADM = "/usr/bin/udevadm"
@@ -348,7 +349,7 @@ def _require_root() -> None:
         raise ControlError("this operation requires root", EXIT_NOT_ROOT)
 
 
-USAGE = """usage: ogui-touchscreen-control <command> [args]
+USAGE = """usage: touchscreen-control <command> [args]
 
 commands:
   status                 Show discovered touchscreens (unprivileged)
